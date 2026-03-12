@@ -57,9 +57,3 @@ python main.py
 4. Click the **✨ Explain this moment** button that appears on the player.
 5. The **Study Timeline** sidebar will open, displaying your new study note.
 6. Once finished, use **Export PDF** to save your notes for offline review.
-
-## 📜 License
-MIT License - Copyright (c) 2026
-
----
-*Empowering students through AI-driven context.*
