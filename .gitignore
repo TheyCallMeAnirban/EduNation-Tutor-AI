@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Extensions/Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Firebase (Removed)
+firebase-config.js
+.firebase/
+database-rules.json
+
+# Project Specific
+backend/faiss_index_*
+backend/video_transcripts_*
+node_modules/
+.DS_Store

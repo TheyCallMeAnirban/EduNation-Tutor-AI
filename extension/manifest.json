@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "EduNation AI Tutor",
+  "version": "1.0",
+  "description": "An AI tutor that explains the exact moment in a lecture video.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.youtube.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "EduNation AI"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.youtube.com/*"],
+      "js": ["jspdf.umd.min.js", "content.js"],
+      "css": ["content.css"]
+    }
+  ]
+}
