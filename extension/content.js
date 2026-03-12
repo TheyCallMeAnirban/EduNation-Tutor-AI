@@ -33,7 +33,8 @@ chrome.runtime.onMessage.addListener((req) => {
 
 function startObserver() {
     const observer = new MutationObserver(() => {
-        const vid = document.querySelector('video');
+        // More specific selector for the main YouTube video player
+        const vid = document.querySelector('video.video-stream.html5-main-video');
         if (vid && vid !== state.videoElement) {
             state.videoElement = vid;
             state.videoElement.addEventListener('pause', handlePause);
@@ -91,10 +92,37 @@ function showOverlay() {
 
     overlayBtn.style.display = 'block';
     
-    // Quick health check
-    fetch('http://127.0.0.1:8000/health')
-        .then(r => overlayBtn.innerText = r.ok ? '✨ Explain this moment' : '⚠️ Offline')
-        .catch(() => overlayBtn.innerText = '⚠️ Offline');
+    // Periodically check health if enabled
+    if (!window.healthInterval) {
+        window.healthInterval = setInterval(checkHealth, 5000);
+    }
+    checkHealth();
+}
+
+const BACKEND_URL = 'http://localhost:8000';
+
+async function checkHealth() {
+    if (!overlayBtn || !state.isEnabled) return;
+    
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000); // 2s timeout
+        
+        const r = await fetch(`${BACKEND_URL}/health`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        
+        if (r.ok) {
+            if (overlayBtn.innerText === '⚠️ Offline' || overlayBtn.innerText === '🔄 Connecting...') {
+                overlayBtn.innerText = '✨ Explain this moment';
+                overlayBtn.style.background = 'rgba(255, 255, 255, 0.2)';
+            }
+        } else {
+            throw new Error();
+        }
+    } catch (e) {
+        overlayBtn.innerText = '⚠️ Offline';
+        overlayBtn.style.background = 'rgba(255, 0, 0, 0.2)';
+    }
 }
 
 function hideOverlay() {
@@ -157,30 +185,84 @@ function refreshPanel() {
 }
 
 function parseTs(t) {
+    if (typeof t === 'number') return t;
+    if (!t || typeof t !== 'string') return 0;
+    
+    // Check for M:SS or H:M:SS
     const p = t.split(':');
-    return p.length === 2 ? parseInt(p[0]) * 60 + parseInt(p[1]) : 0;
+    if (p.length === 3) {
+        return parseInt(p[0]) * 3600 + parseInt(p[1]) * 60 + parseInt(p[2]);
+    } else if (p.length === 2) {
+        return parseInt(p[0]) * 60 + parseInt(p[1]);
+    }
+    
+    // Fallback to raw seconds
+    const s = parseInt(t);
+    return isNaN(s) ? 0 : s;
+}
+
+function formatTs(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+async function fetchWithRetry(url, options, retries = 2) {
+    for (let i = 0; i <= retries; i++) {
+        try {
+            const res = await fetch(url, options);
+            if (!res.ok) {
+                const errorData = await res.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Server error: ${res.status}`);
+            }
+            return res;
+        } catch (err) {
+            if (i === retries) {
+                if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
+                    throw new Error("Cannot reach backend server. Please ensure 'python main.py' is running in the backend folder.");
+                }
+                throw err;
+            }
+            console.log(`Retrying... (${i + 1}/${retries})`);
+            await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+        }
+    }
 }
 
 async function generateNote() {
     const btn = document.getElementById('edunation-btn-generate');
+    const originalText = btn.innerText;
     btn.innerText = 'Processing...';
     btn.disabled = true;
 
+    const currentTime = state.videoElement.currentTime;
+    console.log(`[EduNation] Generating note for video ${state.videoId} at ${currentTime}s`);
+
     try {
-        const res = await fetch('http://127.0.0.1:8000/explain', {
+        const res = await fetchWithRetry(`${BACKEND_URL}/explain`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 video_id: state.videoId,
-                timestamp: state.videoElement.currentTime,
+                timestamp: currentTime,
                 user_question: "Summarize this part of the lecture.",
                 context: ""
             })
         });
 
-        if (!res.ok) throw new Error();
         const data = await res.json();
-        const note = JSON.parse(data.explanation);
+        let note;
+        try {
+            note = JSON.parse(data.explanation);
+        } catch (e) {
+            note = typeof data.explanation === 'object' ? data.explanation : null;
+            if (!note) throw new Error("AI returned an invalid format. Please try again.");
+        }
+
+        // Ensure timestamp is formatted for display
+        if (typeof note.timestamp === 'number' || /^\d+$/.test(note.timestamp)) {
+            note.timestamp = formatTs(parseInt(note.timestamp));
+        }
 
         state.notes.push(note);
         state.title = document.querySelector('h1.ytd-video-primary-info-renderer, #title h1')?.innerText?.trim() || "Video Notes";
@@ -193,10 +275,10 @@ async function generateNote() {
         }});
         
         refreshPanel();
-    } catch {
-        alert("Failed to connect to tutor backend.");
+    } catch (err) {
+        alert(err.message || "An unexpected error occurred.");
     } finally {
-        btn.innerText = 'Analyze Concept';
+        btn.innerText = originalText;
         btn.disabled = false;
     }
 }
