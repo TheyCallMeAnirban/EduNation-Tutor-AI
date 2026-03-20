@@ -1,13 +1,17 @@
 import os
+import json
 import faiss
+import pickle
 import numpy as np
 import logging
+from pathlib import Path
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, AsyncGenerator
 from youtube_transcript_api import YouTubeTranscriptApi
 from sentence_transformers import SentenceTransformer
 from openai import AsyncOpenAI
@@ -22,11 +26,15 @@ logger = logging.getLogger("EduNationAPI")
 
 load_dotenv()
 
+# Persistent cache directory
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
 # Setup models
 logger.info("Loading SentenceTransformer model...")
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Cache for video transcripts and indices (LRU-like cache)
+# In-memory LRU cache on top of disk cache
 MAX_CACHE_SIZE = 50
 video_cache = OrderedDict()
 
@@ -37,13 +45,14 @@ client = AsyncOpenAI(
 )
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting EduNation API...")
+    logger.info("Starting EduNation API v2.0...")
     yield
     logger.info("Shutting down EduNation API...")
 
-app = FastAPI(title="EduNation API", lifespan=lifespan)
+app = FastAPI(title="EduNation API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,9 +62,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "message": "EduNation API is running"}
+    return {"status": "ok", "message": "EduNation API v2.0 is running"}
+
+
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class ExplainRequest(BaseModel):
     video_id: str
@@ -64,44 +77,96 @@ class ExplainRequest(BaseModel):
     user_question: str
     chat_history: Optional[List[Dict[str, str]]] = []
 
+
 class ExplainResponse(BaseModel):
     explanation: str
+
+
+class ChatRequest(BaseModel):
+    video_id: str
+    note: Dict                          # full note object for context
+    user_message: str
+    chat_history: Optional[List[Dict[str, str]]] = []
+
+
+class QuizRequest(BaseModel):
+    video_id: str
+    notes: List[Dict]                   # array of note objects from the session
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def format_time(seconds: float) -> str:
     mins = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{mins}:{secs:02d}"
 
+
+def _disk_paths(video_id: str):
+    return (
+        CACHE_DIR / f"{video_id}.faiss",
+        CACHE_DIR / f"{video_id}.pkl"
+    )
+
+
+def _save_to_disk(video_id: str, chunks, index):
+    faiss_path, pkl_path = _disk_paths(video_id)
+    faiss.write_index(index, str(faiss_path))
+    with open(pkl_path, "wb") as f:
+        pickle.dump(chunks, f)
+    logger.info(f"Saved index to disk: {video_id}")
+
+
+def _load_from_disk(video_id: str):
+    faiss_path, pkl_path = _disk_paths(video_id)
+    if faiss_path.exists() and pkl_path.exists():
+        logger.info(f"Loading index from disk: {video_id}")
+        index = faiss.read_index(str(faiss_path))
+        with open(pkl_path, "rb") as f:
+            chunks = pickle.load(f)
+        return chunks, index
+    return None, None
+
+
 def get_or_build_index(video_id: str):
-    # Check cache and move to end (LRU behavior)
+    # 1. In-memory LRU hit
     if video_id in video_cache:
-        logger.info(f"Cache hit for video: {video_id}")
+        logger.info(f"Memory cache hit: {video_id}")
         video_cache.move_to_end(video_id)
         return video_cache[video_id]
-    
+
+    # 2. Disk cache hit
+    chunks, index = _load_from_disk(video_id)
+    if chunks is not None:
+        if len(video_cache) >= MAX_CACHE_SIZE:
+            oldest_key, _ = video_cache.popitem(last=False)
+            logger.info(f"Memory cache full, evicted: {oldest_key}")
+        video_cache[video_id] = {"chunks": chunks, "index": index}
+        return video_cache[video_id]
+
+    # 3. Build from scratch
     logger.info(f"Building index for video: {video_id}")
     try:
         ts_list = YouTubeTranscriptApi().list(video_id)
-        
-        # Preference: manual English -> general manual -> auto English -> first available
+
         try:
             transcript = ts_list.find_transcript(['en']).fetch()
-        except:
+        except Exception:
             try:
                 manual = [t for t in ts_list if not t.is_generated]
                 transcript = manual[0].fetch() if manual else ts_list.find_transcript(['en']).fetch()
-            except:
+            except Exception:
                 transcript = next(iter(ts_list)).fetch()
 
         if not transcript:
             raise ValueError("Transcript not found")
-        
-        # Group by logical time chunks
+
+        # Group into 40-second chunks
         chunks = []
         current_text = ""
         chunk_start = 0
-        WINDOW_SECONDS = 40 
-        
+        WINDOW_SECONDS = 40
+
         def get_v(obj, key):
             return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
 
@@ -109,12 +174,12 @@ def get_or_build_index(video_id: str):
             start = get_v(item, 'start')
             dur = get_v(item, 'duration') or 0
             text = (get_v(item, 'text') or "").replace('\n', ' ')
-            
+
             if current_text == "":
                 chunk_start = start
-            
+
             current_text += f"{text} "
-            
+
             if (start + dur - chunk_start) > WINDOW_SECONDS or i == len(transcript) - 1:
                 chunks.append({
                     "text": current_text.strip(),
@@ -122,84 +187,102 @@ def get_or_build_index(video_id: str):
                     "end": start + dur
                 })
                 current_text = ""
-        
-        # Indexing
+
         texts = [c['text'] for c in chunks]
         embs = embedder.encode(texts, convert_to_numpy=True)
-        idx = faiss.IndexFlatL2(embs.shape[1])
-        idx.add(embs)
-        
-        # Cache management
+        index = faiss.IndexFlatL2(embs.shape[1])
+        index.add(embs)
+
+        # Save to disk and memory
+        _save_to_disk(video_id, chunks, index)
+
         if len(video_cache) >= MAX_CACHE_SIZE:
             oldest_key, _ = video_cache.popitem(last=False)
-            logger.info(f"Cache full, evicted: {oldest_key}")
-            
-        video_cache[video_id] = {"transcript": transcript, "chunks": chunks, "index": idx}
+            logger.info(f"Memory cache full, evicted: {oldest_key}")
+
+        video_cache[video_id] = {"chunks": chunks, "index": index}
         logger.info(f"Successfully indexed video: {video_id}")
         return video_cache[video_id]
-        
+
     except Exception as e:
         logger.error(f"Error processing {video_id}: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to process transcript: {str(e)}")
 
-@app.post("/explain", response_model=ExplainResponse)
-async def explain_concept(request: ExplainRequest):
-    logger.info(f"Request: explain concept for {request.video_id} at {request.timestamp}s")
-    try:
-        data = get_or_build_index(request.video_id)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in explain_concept: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-         
+
+def _get_rag_context(video_id: str, query: str, top_k: int = 3, max_chars: int = 1200) -> str:
+    data = get_or_build_index(video_id)
     index = data['index']
     chunks = data['chunks']
-    
-    # RAG search - find top 5 relevant chunks instead of 3
-    query_emb = embedder.encode([f"{request.context} {request.user_question}"], convert_to_numpy=True)
-    _, indices = index.search(query_emb, 5)
-    
+
+    query_emb = embedder.encode([query], convert_to_numpy=True)
+    _, indices = index.search(query_emb, top_k)
+
     ctx_list = []
     for idx_list in indices:
         for idx in idx_list:
             if idx != -1 and idx < len(chunks):
-                # Include more padding: 2 chunks before and 2 after
-                s, e = max(0, idx - 2), min(len(chunks) - 1, idx + 2)
+                s, e = max(0, idx - 1), min(len(chunks) - 1, idx + 1)
                 for i in range(s, e + 1):
                     ctx_list.append(chunks[i]['text'])
-            
+
+    combined = "\n".join(set(ctx_list))
+    return combined[:max_chars]
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.post("/explain", response_model=ExplainResponse)
+async def explain_concept(request: ExplainRequest):
+    logger.info(f"Explain request: {request.video_id} at {request.timestamp}s")
+
+    try:
+        ctx = _get_rag_context(
+            request.video_id,
+            f"{request.context} {request.user_question}",
+            top_k=3,
+            max_chars=1000
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Index error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
     formatted_timestamp = format_time(request.timestamp)
-    prompt = f"""You are an expert AI tutor generating high-quality study notes for students.
-Paused at: {request.timestamp} seconds ({formatted_timestamp})
 
-Lecture context (around the current timestamp):
-{"\n".join(set(ctx_list))}
+    prompt = f"""You are an AI tutor. Generate a study note as JSON.
+Timestamp: {formatted_timestamp}
 
-Student Question: "{request.user_question}"
+Lecture context:
+{ctx}
 
-Instructions:
-1. Topic: Provide a professional name for the concept.
-2. Timestamp: YOU MUST USE THE EXACT STRING '{formatted_timestamp}'. DO NOT CHANGE IT OR ESTIMATE IT.
-3. KeyIdea: Single sentence summarizing the core takeaway.
-4. Explanation: Provide a comprehensive, clear, and humanly understandable explanation. Use 100-150 words. Avoid generic phrases; explain the *how* and *why* based on the context provided.
-5. Example: A simple, relatable analogy or real-world example to illustrate the concept.
+Question: "{request.user_question}"
 
-Respond with ONLY this JSON structure:
+Respond with ONLY valid JSON:
 {{
   "topic": "Concept name",
   "timestamp": "{formatted_timestamp}",
-  "keyIdea": "Main takeaway",
-  "explanation": "Detailed explanation here...",
-  "example": "Relatable example here..."
+  "keyIdea": "One sentence core takeaway",
+  "explanation": "Clear explanation (60-80 words)",
+  "example": "A relatable real-world example",
+  "difficulty": "Beginner"
 }}
+diffculty must be exactly one of: Beginner, Intermediate, Advanced.
 """
-    
+
     messages = [
-        {"role": "system", "content": "Knowledgeable tutor, outputs structured JSON."},
+        {"role": "system", "content": "Expert tutor. Output only valid JSON."},
         {"role": "user", "content": prompt}
     ]
-    
+
+    # Include previous chat context if provided
+    if request.chat_history:
+        messages = (
+            [messages[0]]
+            + request.chat_history
+            + [messages[1]]
+        )
+
     try:
         res = await client.chat.completions.create(
             model=LLM_MODEL,
@@ -209,11 +292,126 @@ Respond with ONLY this JSON structure:
         logger.info(f"LLM response received for {request.video_id}")
         return ExplainResponse(explanation=res.choices[0].message.content)
     except Exception as e:
-        logger.error(f"LLM Error for {request.video_id}: {str(e)}")
+        logger.error(f"LLM Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"LLM Error: {str(e)}")
+
+
+@app.post("/chat")
+async def chat_with_note(request: ChatRequest):
+    """Multi-turn follow-up chat about a specific note. Streams response via SSE."""
+    logger.info(f"Chat request: {request.video_id} — '{request.user_message[:60]}'")
+
+    try:
+        rag_ctx = _get_rag_context(
+            request.video_id,
+            request.user_message,
+            top_k=2,
+            max_chars=600
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"RAG error in chat: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+    note = request.note
+    system_prompt = f"""You are EduNation, an AI tutor. Answer the student's follow-up concisely (2-3 sentences).
+
+Note — Topic: {note.get('topic', '')} | Key Idea: {note.get('keyIdea', '')}
+Context: {rag_ctx}
+
+Do NOT output JSON."""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in (request.chat_history or []):
+        messages.append(msg)
+    messages.append({"role": "user", "content": request.user_message})
+
+    async def sse_generator() -> AsyncGenerator[str, None]:
+        try:
+            stream = await client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                stream=True
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield f"data: {json.dumps({'token': delta})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Streaming error: {str(e)}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+
+
+@app.post("/quiz")
+async def generate_quiz(request: QuizRequest):
+    """Generate 5 MCQ quiz questions from the session's saved notes."""
+    logger.info(f"Quiz request for {request.video_id} with {len(request.notes)} notes")
+
+    if not request.notes:
+        raise HTTPException(status_code=400, detail="No notes provided to generate a quiz from.")
+
+    # Build a compact summary of notes (cap at 5 notes, short fields only)
+    notes_summary = "\n".join([
+        f"- {n.get('topic', '')}: {n.get('keyIdea', '')}"
+        for n in request.notes[:5]
+    ])
+
+    # Optionally supplement with RAG context (small)
+    try:
+        first_topic = request.notes[0].get('topic', '')
+        rag_ctx = _get_rag_context(request.video_id, first_topic, top_k=2, max_chars=500)
+    except Exception:
+        rag_ctx = ""
+
+    prompt = f"""Generate 5 MCQ quiz questions from these study notes:
+{notes_summary}
+{chr(10) + rag_ctx if rag_ctx else ""}
+
+Rules: 4 options each, 1 correct, test comprehension, plausible distractors.
+
+Respond ONLY with this JSON (no markdown):
+{{
+  "questions": [
+    {{
+      "question": "?",
+      "options": ["A", "B", "C", "D"],
+      "correct": 0,
+      "explanation": "brief reason"
+    }}
+  ]
+}}
+"""
+
+    try:
+        res = await client.chat.completions.create(
+            model=LLM_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "Expert quiz generator. Output only valid JSON."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        logger.info(f"Quiz generated for {request.video_id}")
+        return json.loads(res.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Quiz generation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Quiz generation failed: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting uvicorn server...")
-    # reload=False is safer on Windows to prevent file-watching hangs
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
