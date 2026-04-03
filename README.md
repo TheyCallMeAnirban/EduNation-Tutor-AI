@@ -151,10 +151,4 @@ docker compose up
 
 ---
 
-## 📜 License
 
-MIT License — Copyright © 2026 EduNation AI
-
----
-
-*Empowering students with AI-driven, memory-first learning.*
