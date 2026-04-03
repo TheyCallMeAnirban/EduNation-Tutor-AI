@@ -25,5 +25,6 @@ database-rules.json
 # Project Specific
 backend/faiss_index_*
 backend/video_transcripts_*
+backend/cache/
 node_modules/
 .DS_Store
