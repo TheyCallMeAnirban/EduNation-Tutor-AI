@@ -94,10 +94,3 @@ python main.py
 | Anki CSV | Sidebar + Notebook | Spaced repetition flashcards |
 
 ---
-
-## 📜 License
-
-MIT License — Copyright (c) 2026
-
----
-*Empowering students through AI-driven context.*
