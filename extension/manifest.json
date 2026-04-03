@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "EduNation AI Tutor",
-  "version": "1.0",
+  "version": "2.0",
   "description": "An AI tutor that explains the exact moment in a lecture video.",
   "permissions": [
     "storage",
@@ -20,6 +20,15 @@
   "background": {
     "service_worker": "background.js",
     "type": "module"
+  },
+  "commands": {
+    "trigger-explain": {
+      "suggested_key": {
+        "default": "Alt+E",
+        "mac": "Alt+E"
+      },
+      "description": "Trigger EduNation explain for the current moment"
+    }
   },
   "content_scripts": [
     {

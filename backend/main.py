@@ -4,6 +4,7 @@ import faiss
 import pickle
 import numpy as np
 import logging
+import time
 from pathlib import Path
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -30,15 +31,17 @@ load_dotenv()
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# Setup models
-logger.info("Loading SentenceTransformer model...")
+# Setup embedding model
+_model_load_start = time.time()
+logger.info("Loading SentenceTransformer model (all-MiniLM-L6-v2)...")
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
+logger.info(f"Model loaded in {time.time() - _model_load_start:.1f}s")
 
 # In-memory LRU cache on top of disk cache
 MAX_CACHE_SIZE = 50
 video_cache = OrderedDict()
 
-# OpenAI Setup
+# OpenAI / compatible LLM client
 client = AsyncOpenAI(
     api_key=os.getenv("LLM_API_KEY", "dummy_key"),
     base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -48,27 +51,51 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting EduNation API v2.0...")
+    logger.info("━" * 50)
+    logger.info("  EduNation API v2.1 — ready on http://0.0.0.0:8000")
+    logger.info("━" * 50)
     yield
     logger.info("Shutting down EduNation API...")
 
-app = FastAPI(title="EduNation API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="EduNation API", version="2.1.0", lifespan=lifespan)
 
+# CORS — restrict to localhost origins in all environments
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        # Chrome extensions use a special origin; wildcard needed for extension requests
+        "*",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 
+# ── Health & Stats ─────────────────────────────────────────────────────────────
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "message": "EduNation API v2.0 is running"}
+    return {"status": "ok", "message": "EduNation API v2.1 is running"}
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+@app.get("/stats")
+async def get_stats():
+    """Return stats about the local disk cache for the popup UI."""
+    cached_files = list(CACHE_DIR.glob("*.faiss"))
+    total_videos = len(cached_files)
+    total_size_mb = sum(f.stat().st_size for f in CACHE_DIR.iterdir() if f.is_file()) / (1024 * 1024)
+    return {
+        "cached_videos": total_videos,
+        "cache_size_mb": round(total_size_mb, 2),
+        "model": "all-MiniLM-L6-v2",
+        "llm": LLM_MODEL,
+    }
+
+
+# ── Pydantic Models ────────────────────────────────────────────────────────────
 
 class ExplainRequest(BaseModel):
     video_id: str
@@ -193,7 +220,6 @@ def get_or_build_index(video_id: str):
         index = faiss.IndexFlatL2(embs.shape[1])
         index.add(embs)
 
-        # Save to disk and memory
         _save_to_disk(video_id, chunks, index)
 
         if len(video_cache) >= MAX_CACHE_SIZE:
@@ -201,7 +227,7 @@ def get_or_build_index(video_id: str):
             logger.info(f"Memory cache full, evicted: {oldest_key}")
 
         video_cache[video_id] = {"chunks": chunks, "index": index}
-        logger.info(f"Successfully indexed video: {video_id}")
+        logger.info(f"Successfully indexed {len(chunks)} chunks for: {video_id}")
         return video_cache[video_id]
 
     except Exception as e:
@@ -217,15 +243,18 @@ def _get_rag_context(video_id: str, query: str, top_k: int = 3, max_chars: int =
     query_emb = embedder.encode([query], convert_to_numpy=True)
     _, indices = index.search(query_emb, top_k)
 
-    ctx_list = []
-    for idx_list in indices:
-        for idx in idx_list:
-            if idx != -1 and idx < len(chunks):
-                s, e = max(0, idx - 1), min(len(chunks) - 1, idx + 1)
-                for i in range(s, e + 1):
-                    ctx_list.append(chunks[i]['text'])
+    # Use dict.fromkeys to deduplicate while preserving insertion order
+    seen = dict.fromkeys(
+        i
+        for idx_list in indices
+        for idx in idx_list
+        if idx != -1 and idx < len(chunks)
+        for i in range(max(0, idx - 1), min(len(chunks), idx + 2))
+    )
 
-    combined = "\n".join(set(ctx_list))
+    # Sort by chunk start time so the context reads chronologically
+    sorted_indices = sorted(seen.keys(), key=lambda i: chunks[i]['start'])
+    combined = "\n".join(chunks[i]['text'] for i in sorted_indices)
     return combined[:max_chars]
 
 
@@ -267,7 +296,7 @@ Respond with ONLY valid JSON:
   "example": "A relatable real-world example",
   "difficulty": "Beginner"
 }}
-diffculty must be exactly one of: Beginner, Intermediate, Advanced.
+difficulty must be exactly one of: Beginner, Intermediate, Advanced.
 """
 
     messages = [
@@ -275,7 +304,6 @@ diffculty must be exactly one of: Beginner, Intermediate, Advanced.
         {"role": "user", "content": prompt}
     ]
 
-    # Include previous chat context if provided
     if request.chat_history:
         messages = (
             [messages[0]]
@@ -289,7 +317,7 @@ diffculty must be exactly one of: Beginner, Intermediate, Advanced.
             response_format={"type": "json_object"},
             messages=messages
         )
-        logger.info(f"LLM response received for {request.video_id}")
+        logger.info(f"Explain response received for {request.video_id}")
         return ExplainResponse(explanation=res.choices[0].message.content)
     except Exception as e:
         logger.error(f"LLM Error: {str(e)}")
@@ -353,8 +381,6 @@ Do NOT output JSON."""
     )
 
 
-
-
 @app.post("/quiz")
 async def generate_quiz(request: QuizRequest):
     """Generate 5 MCQ quiz questions from the session's saved notes."""
@@ -363,16 +389,18 @@ async def generate_quiz(request: QuizRequest):
     if not request.notes:
         raise HTTPException(status_code=400, detail="No notes provided to generate a quiz from.")
 
-    # Build a compact summary of notes (cap at 5 notes, short fields only)
+    # Build a compact summary of all notes (capped at 8)
     notes_summary = "\n".join([
         f"- {n.get('topic', '')}: {n.get('keyIdea', '')}"
-        for n in request.notes[:5]
+        for n in request.notes[:8]
     ])
 
-    # Optionally supplement with RAG context (small)
+    # Build a combined query from all note topics for better RAG coverage
+    combined_query = " ".join(
+        n.get('topic', '') for n in request.notes[:8] if n.get('topic')
+    )
     try:
-        first_topic = request.notes[0].get('topic', '')
-        rag_ctx = _get_rag_context(request.video_id, first_topic, top_k=2, max_chars=500)
+        rag_ctx = _get_rag_context(request.video_id, combined_query, top_k=3, max_chars=600)
     except Exception:
         rag_ctx = ""
 
